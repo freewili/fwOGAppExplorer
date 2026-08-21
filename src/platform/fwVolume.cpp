@@ -14,6 +14,16 @@
   #include <cstring>
   #include <fcntl.h>
   #include <unistd.h>
+  #if defined(__APPLE__)
+    // getmntinfo() -- macOS has no /proc/mounts -- and IOKit, which answers
+    // the USB-tree question /sys/bus/usb/devices answers on Linux.
+    #include <sys/param.h>
+    #include <sys/ucred.h>
+    #include <sys/mount.h>
+    #include <CoreFoundation/CoreFoundation.h>
+    #include <IOKit/IOKitLib.h>
+    #include <DiskArbitration/DiskArbitration.h>
+  #endif
 #endif
 
 // VERIFIED ON LINUX against a real FreeWili 1-OG, on the MAIN CPU.
@@ -46,6 +56,11 @@
 // The two-volume behaviour below was measured with loopback FAT filesystems
 // carrying the RPI-RP2 label, which is what establishes udisks2's mount-point
 // naming, but no second FreeWili was attached.
+//
+// BOARD-VERIFIED ON MACOS 2026-08-14, same board: the __APPLE__ branches below
+// (getmntinfo, F_FULLFSYNC, the DiskArbitration unmount and nobrowse remount)
+// flashed it end to end. That run predates the v2 rebase; on the rebased
+// branch only the build and test suite were re-verified, the flash was not.
 
 namespace fwog {
 
@@ -70,6 +85,22 @@ std::string unescapeMount(std::string_view s)
             i += 3;
         } else {
             out.push_back(s[i]);
+        }
+    }
+    return out;
+}
+
+std::string escapeMount(std::string_view s)
+{
+    std::string out;
+    out.reserve(s.size());
+    for (char ch : s) {
+        if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\\') {
+            const unsigned c = static_cast<unsigned char>(ch);
+            out += { '\\', char('0' + (c >> 6)), char('0' + ((c >> 3) & 7)),
+                     char('0' + (c & 7)) };
+        } else {
+            out.push_back(ch);
         }
     }
     return out;
@@ -134,7 +165,8 @@ bool isRp2BootromInfo(std::string_view infoUf2Txt)
     return false;
 }
 
-std::string unmountedBootselNotice(int bootselDevices, size_t volumesFound)
+std::string unmountedBootselNotice(int bootselDevices, size_t volumesFound,
+                                   MountRemedy remedy)
 {
     // Nothing to explain unless a CPU is sitting in the bootrom that no mounted
     // volume accounts for.
@@ -175,6 +207,27 @@ std::string unmountedBootselNotice(int bootselDevices, size_t volumesFound)
                   " CPUs are in BOOTSEL but their RPI-RP2 drives are not mounted, so "
                   "there is nothing to copy to. This app writes a UF2 as a FILE and "
                   "cannot mount the drives itself.";
+
+    // The macOS wording exists because this state is REACHABLE there by the
+    // app's own hand: copyToVolume()'s mac arm unmounts the volume before it
+    // writes, so a copy the bootrom never consumed (a foreign UF2 dropped in
+    // by hand, say) leaves the device attached with its drive mounted nowhere
+    // -- a state Linux and Windows never enter on their own. The by-name
+    // collapsing hazard is the same on both: `diskutil mount RPI-RP2` picks
+    // one of the identically-labelled drives just as by-label does.
+    if (remedy == MountRemedy::Diskutil) {
+        if (bootselDevices == 1)
+            return situation + " Mount it and try again -- for example: "
+                               "diskutil mount RPI-RP2";
+        return situation +
+               " Mount it and try again: run diskutil list to find each drive's "
+               "disk identifier (an external DOS_FAT volume named RPI-RP2), then "
+               "diskutil mount /dev/<identifier>. Do not mount by the name "
+               "RPI-RP2 here -- " +
+               std::to_string(bootselDevices) +
+               " drives carry that same name, so it picks just one of them at "
+               "random.";
+    }
 
     if (bootselDevices == 1)
         return situation + " Mount it and try again -- for example: udisksctl mount -b "
@@ -317,6 +370,191 @@ struct ErrorModeGuard {
 };
 #endif
 
+#if defined(__APPLE__)
+/// Cleanly unmount the volume through DiskArbitration, waiting for the verdict.
+///
+/// Why this exists: the RP2040 bootrom detaches its device the instant the
+/// last UF2 block arrives, and a volume that vanishes while mounted makes
+/// macOS post "Disk Not Ejected Properly" at the user -- on every single
+/// flash, for a disappearance that is the SUCCESS signal. Unmounting first
+/// fixes both halves at once: unmount(2) semantics flush every dirty page to
+/// the device before detaching (so this replaces flushToDevice()'s
+/// F_FULLFSYNC as the durability step, it does not skip it), and by the time
+/// the bootrom reboots the system has already let go of the volume, so there
+/// is nothing improper to complain about.
+///
+/// DiskArbitration rather than unmount(2) because the syscall needs root for
+/// a diskarbitrationd-owned mount; DADiskUnmount is how an ordinary console
+/// user ejects a USB drive, no privilege required.
+///
+/// false means "could not unmount" -- volume already gone (the bootrom won
+/// the race; the notice already fired and nothing here can recall it), or
+/// something holds the volume open (Spotlight indexing it). The caller falls
+/// back to the fsync path, which was the whole behaviour before this
+/// function existed; the flash outcome is identical either way, only the
+/// notification differs.
+namespace da {
+
+struct Result { bool done = false; bool ok = false; };
+
+void callback(DADiskRef, DADissenterRef dissenter, void* ctx)
+{
+    auto* r = static_cast<Result*>(ctx);
+    r->ok   = (dissenter == nullptr);
+    r->done = true;
+    CFRunLoopStop(CFRunLoopGetCurrent());
+}
+
+/// How long to wait for one request's verdict. It bounds the writeback a
+/// request can imply. Generous on purpose: FreeWiliDisplayV67 is 16 MB and a
+/// FAT volume over full-speed USB moves ~1 MB/s, so a tight budget would turn
+/// the largest legitimate image into a spurious failure; the deadline exists
+/// only so a wedged diskarbitrationd cannot park the flash worker forever.
+///
+/// Recorded, not fixed: the remount waits in remountNoBrowse() reuse this
+/// writeback-sized budget though a mount implies no writeback, so a truly
+/// wedged diskarbitrationd can hold one copy step for several deadlines in a
+/// row (and FlashController's cooperative cancel never reaches these loops).
+/// Shortening those waits is a tuning question for a machine that exhibits
+/// the wedge, not something to guess at from a healthy one. Note for any
+/// future refactor: on timeout the pending callback still holds a pointer to
+/// the caller's stack Result -- safe today only because the session is
+/// unscheduled, released and never pumped again on this thread.
+constexpr CFAbsoluteTime kDaVerdictDeadlineSec = 120.0;
+
+/// Pump the scheduled run loop until the callback lands or the deadline
+/// passes. True only for an actual clean verdict -- a timeout is a failure.
+bool awaitVerdict(Result& r)
+{
+    const CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + kDaVerdictDeadlineSec;
+    while (!r.done && CFAbsoluteTimeGetCurrent() < deadline)
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, true);
+    return r.done && r.ok;
+}
+
+/// Run one DiskArbitration request against the volume at `mountPoint` and
+/// wait for its verdict.
+template <typename Fn>
+bool request(const std::string& mountPoint, Fn&& start)
+{
+    DASessionRef session = DASessionCreate(kCFAllocatorDefault);
+    if (!session) return false;
+
+    bool ok = false;
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+        kCFAllocatorDefault, reinterpret_cast<const UInt8*>(mountPoint.c_str()),
+        static_cast<CFIndex>(mountPoint.size()), true);
+    DADiskRef disk =
+        url ? DADiskCreateFromVolumePath(kCFAllocatorDefault, session, url) : nullptr;
+    if (disk) {
+        DASessionScheduleWithRunLoop(session, CFRunLoopGetCurrent(),
+                                     kCFRunLoopDefaultMode);
+        Result result;
+        start(disk, &result);
+        ok = awaitVerdict(result);
+        DASessionUnscheduleFromRunLoop(session, CFRunLoopGetCurrent(),
+                                       kCFRunLoopDefaultMode);
+        CFRelease(disk);
+    }
+    if (url) CFRelease(url);
+    CFRelease(session);
+    return ok;
+}
+
+} // namespace da
+
+bool unmountVolumeGracefully(const std::string& mountPoint)
+{
+    return da::request(mountPoint, [](DADiskRef disk, da::Result* r) {
+        DADiskUnmount(disk, kDADiskUnmountOptionDefault, da::callback, r);
+    });
+}
+
+/// Remount the volume with `nobrowse`, so Finder never learns it exists.
+///
+/// This is the half that actually prevents the "Disk Not Ejected Properly"
+/// notification. The unmount-after-copy above cannot: the unmount's own
+/// writeback is what delivers the final UF2 block, and the bootrom reboots
+/// the instant it has it -- mid-unmount, volume still mounted, notification
+/// posted. MEASURED, on the first board flashed from a Mac: the graceful
+/// unmount was in place and the notification appeared anyway. No ordering of
+/// flush and unmount wins that race, because the flush IS the trigger.
+///
+/// What does win it: make the volume one Finder never tracks. diskarbitrationd
+/// posts the notification for browsable volumes; a `nobrowse` mount vanishing
+/// is nobody's business. So: cleanly unmount the auto-mounted volume BEFORE
+/// any write -- nothing is dirty yet, so this is instant and genuinely clean
+/// -- and remount it nobrowse. The copy then proceeds against the remounted
+/// volume and the reboot takes down a volume macOS was never showing anyone.
+///
+/// The disk is keyed by BSD name, captured from statfs BEFORE the unmount: a
+/// volume-path DADiskRef goes stale the moment the volume unmounts, while the
+/// BSD device persists until the USB device itself detaches.
+///
+/// Returns the (possibly identical) mount point of the nobrowse mount, or
+/// nullopt for "leave things as they are". On a failed remount it tries to
+/// put the ordinary mount back rather than leave the board's volume mounted
+/// nowhere -- the flash this call serves still needs SOMETHING to copy into,
+/// and so does the user's next attempt.
+std::optional<std::string> remountNoBrowse(const std::string& mountPoint)
+{
+    struct statfs sfs = {};
+    if (::statfs(mountPoint.c_str(), &sfs) != 0) return std::nullopt;
+    constexpr std::string_view kDev = "/dev/";
+    std::string bsd = sfs.f_mntfromname;
+    if (bsd.rfind(kDev, 0) == 0) bsd.erase(0, kDev.size());
+    if (bsd.empty()) return std::nullopt;
+
+    DASessionRef session = DASessionCreate(kCFAllocatorDefault);
+    if (!session) return std::nullopt;
+    DADiskRef disk = DADiskCreateFromBSDName(kCFAllocatorDefault, session, bsd.c_str());
+    std::optional<std::string> out;
+    if (disk) {
+        DASessionScheduleWithRunLoop(session, CFRunLoopGetCurrent(),
+                                     kCFRunLoopDefaultMode);
+        da::Result unmounted;
+        DADiskUnmount(disk, kDADiskUnmountOptionDefault, da::callback, &unmounted);
+        if (da::awaitVerdict(unmounted)) {
+            // NULL path: diskarbitrationd picks the mount point, exactly as it
+            // did for the browsable mount. The argv form is the only way to
+            // pass a mount OPTION (nobrowse is not a DADiskMountOptions bit).
+            CFStringRef args[] = { CFSTR("nobrowse"), nullptr };
+            da::Result mounted;
+            DADiskMountWithArguments(disk, nullptr, kDADiskMountOptionDefault,
+                                     da::callback, &mounted, args);
+            if (da::awaitVerdict(mounted)) {
+                // Where did it land? Asked of the disk itself rather than
+                // assumed unchanged, so a diskarbitrationd that uniquifies the
+                // path cannot silently break the copy that follows.
+                if (CFDictionaryRef desc = DADiskCopyDescription(disk)) {
+                    auto vol = static_cast<CFURLRef>(CFDictionaryGetValue(
+                        desc, kDADiskDescriptionVolumePathKey));
+                    char buf[MAXPATHLEN] = {};
+                    if (vol && CFURLGetFileSystemRepresentation(
+                                   vol, true, reinterpret_cast<UInt8*>(buf),
+                                   sizeof(buf)))
+                        out = std::string(buf);
+                    CFRelease(desc);
+                }
+            } else {
+                // Do not strand the volume unmounted: put the ordinary mount
+                // back, best-effort. If this fails too the board re-presents
+                // its drive on the next BOOTSEL entry anyway.
+                da::Result remounted;
+                DADiskMount(disk, nullptr, kDADiskMountOptionDefault, da::callback,
+                            &remounted);
+                da::awaitVerdict(remounted);
+            }
+        }
+        DASessionUnscheduleFromRunLoop(session, CFRunLoopGetCurrent(),
+                                       kCFRunLoopDefaultMode);
+        CFRelease(disk);
+    }
+    CFRelease(session);
+    return out;
+}
+#endif
+
 #if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 /// fsync `file`, then the directory holding it, so both the data and the
 /// directory entry are on the device before the caller is told anything.
@@ -360,11 +598,32 @@ std::expected<void, std::string> flushToDevice(const std::filesystem::path& file
         return std::unexpected(std::string("cannot reopen the written file: ") +
                                std::strerror(errno));
     }
+#if defined(__APPLE__)
+    // fsync() on macOS is documented NOT to force the write through the drive's
+    // own cache; F_FULLFSYNC is the call that does, and this function exists
+    // precisely to close the "reported success while bytes were still in
+    // flight" gap. A filesystem that does not support F_FULLFSYNC (msdos is not
+    // guaranteed to) falls back to the plain fsync rather than failing a flash
+    // over a durability nicety the platform declined to provide.
+    int rc = ::fcntl(fd, F_FULLFSYNC);
+    if (rc != 0) rc = ::fsync(fd);
+#else
     const int rc = ::fsync(fd);
+#endif
     const int fsyncErrno = errno;
     ::close(fd);
-    if (rc != 0 && !vanished(fsyncErrno))
+    if (rc != 0 && !vanished(fsyncErrno)) {
+        // vanished()'s errno set was measured on Linux; which errno macOS's
+        // msdos surfaces when the bootrom detaches mid-F_FULLFSYNC was not,
+        // and EIO is at least as likely there. EIO from a device that is
+        // still present is a genuine failure though, so rather than widen the
+        // set to an ambiguous errno, ask the question the set approximates:
+        // if the destination itself is gone, the device left, and gone means
+        // finished for the same reason as everywhere else in this function.
+        std::error_code gone;
+        if (!std::filesystem::exists(file, gone) && !gone) return {};
         return std::unexpected(std::strerror(fsyncErrno));
+    }
 
     // The directory entry, best-effort. A FAT directory whose entry has not
     // been written yet leaves a file the bootrom cannot see, but a failure to
@@ -418,12 +677,54 @@ std::vector<std::string> findRpiRp2Volumes()
     // inline, either could be deleted and nothing failed.
     detail::VolumeIo io;
 
+#if defined(__APPLE__)
+    // No /proc/mounts here; getmntinfo() is the same table from the kernel's
+    // own hand. It is rendered into /proc/mounts's line format so that
+    // detail::selectRpiRp2Volumes() -- the filters, the tests that pin them,
+    // and the octal unescaping -- stays one shared implementation.
+    // detail::escapeMount() is the exact inverse of detail::unescapeMount():
+    // macOS mounts a SECOND volume with the same label at "/Volumes/RPI-RP2 1",
+    // and a space fed unescaped into a whitespace-split parser would truncate
+    // the mount point at "/Volumes/RPI-RP2" -- a path that names the OTHER
+    // board's volume. The fstype macOS gives a FAT volume is "msdos", which the
+    // shared filter already accepts for the manually-mounted Linux case.
+    io.readMounts = [] {
+        // MNT_NOWAIT: the cached table, no per-filesystem statfs round trip.
+        // This runs in the flash worker's ~250ms poll loop, and a stalled
+        // network mount must not be allowed to hold that loop up just to
+        // refresh size fields nothing here reads.
+        //
+        // getmntinfo_r_np, NOT getmntinfo: the plain call hands back a pointer
+        // into one process-wide static allocation that every call from any
+        // thread reallocs and overwrites -- and this lambda IS called from two
+        // threads at once on every flash (the Recovery tab's poll on the UI
+        // thread at 500ms, the flash/probe worker at 250ms). Torn strings or a
+        // read of freed memory mid-flash is the price of the convenient
+        // spelling; the _r_np variant allocates a fresh array the caller
+        // frees, which is the same getpwuid_r-over-getpwuid reasoning
+        // fwPaths.cpp already recorded.
+        struct statfs* mounts = nullptr;
+        const int n = ::getmntinfo_r_np(&mounts, MNT_NOWAIT);
+        std::string out;
+        for (int i = 0; i < n; ++i) {
+            out += detail::escapeMount(mounts[i].f_mntfromname);
+            out += ' ';
+            out += detail::escapeMount(mounts[i].f_mntonname);
+            out += ' ';
+            out += mounts[i].f_fstypename;   // kernel identifier, never escaped
+            out += " - 0 0\n";
+        }
+        ::free(mounts);                      // _r_np's contract: caller frees
+        return out;
+    };
+#else
     io.readMounts = [] {
         std::ifstream f("/proc/mounts", std::ios::binary);
         std::ostringstream ss;
         ss << f.rdbuf();
         return ss.str();
     };
+#endif
 
     io.readInfoUf2 = [](const std::string& mountPoint) -> std::optional<std::string> {
         std::ifstream info(std::filesystem::path(mountPoint) / "INFO_UF2.TXT",
@@ -454,6 +755,36 @@ int countBootselDevices()
     // unmountedBootselNotice() produce nothing, so no caller has to branch on
     // the platform to decide whether to ask.
     return 0;
+#elif defined(__APPLE__)
+    // The same question the Linux branch below asks of /sys/bus/usb/devices,
+    // asked of the IOKit registry: one IOUSBHostDevice node per physical
+    // device, so two boards in BOOTSEL count as two -- the by-label collapse
+    // described below cannot happen here either. Any failure returns 0, which
+    // silences unmountedBootselNotice() rather than inventing a device.
+    //
+    // (In practice macOS auto-mounts the bootrom volume like Windows does, so
+    // this notice should rarely fire -- but "device present, nothing mounted"
+    // IS reachable here, e.g. after `diskutil unmount`, so the honest count is
+    // computed rather than hard-coded to 0 on the Windows argument.)
+    CFMutableDictionaryRef match = IOServiceMatching("IOUSBHostDevice");
+    if (!match) return 0;
+    const int32_t vid = 0x2e8a, pid = 0x0003;   // "RP2 Boot", same as below
+    CFNumberRef v = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &vid);
+    CFNumberRef p = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pid);
+    CFDictionarySetValue(match, CFSTR("idVendor"), v);
+    CFDictionarySetValue(match, CFSTR("idProduct"), p);
+    CFRelease(v);
+    CFRelease(p);
+    io_iterator_t it = IO_OBJECT_NULL;
+    // IOServiceGetMatchingServices consumes `match` whether it succeeds or not.
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, match, &it) != KERN_SUCCESS)
+        return 0;
+    int n = 0;
+    for (io_object_t dev; (dev = IOIteratorNext(it)) != IO_OBJECT_NULL;
+         IOObjectRelease(dev))
+        ++n;
+    IOObjectRelease(it);
+    return n;
 #else
     // Counted from the USB device tree rather than from /dev/disk/by-label,
     // deliberately. udev publishes ONE by-label symlink per label, so two
@@ -500,10 +831,63 @@ std::expected<void, std::string> copyToVolume(const std::filesystem::path& src,
     const auto srcSize = std::filesystem::file_size(src, ec);
     if (ec) return std::unexpected("cannot read " + src.string() + ": " + ec.message());
 
-    const auto dst = std::filesystem::path(volume) / src.filename();
+#if defined(__APPLE__)
+    // BEFORE the first byte is written: take the volume off Finder's books.
+    // See remountNoBrowse() for why this ordering is the only one that
+    // prevents the "Disk Not Ejected Properly" notification -- once any block
+    // of the image is in flight, no unmount can beat the bootrom's reboot to
+    // the punch. On any failure the copy proceeds against the original,
+    // browsable mount; the cost is the notification, never the flash.
+    std::string targetVolume = volume;
+    if (auto nb = remountNoBrowse(volume)) targetVolume = *nb;
+
+    // remountNoBrowse() unmounts before anything is written, which revokes
+    // this function's own precondition by its own hand: if both its remounts
+    // then fail AND a non-DA-owned /Volumes/RPI-RP2 directory survives the
+    // unmount (diskarbitrationd removes only mount-point directories it
+    // created), the path above is now a plain directory on the boot volume --
+    // and the copy below would put the image on the internal disk, pass the
+    // size check, and report a flash that never reached a board: the exact
+    // failure this file's comments call the worst one. So ask the filesystem
+    // directly: the target must still BE a mount point, of a FAT volume.
+    {
+        struct statfs sfs{};
+        if (::statfs(targetVolume.c_str(), &sfs) != 0 ||
+            targetVolume != sfs.f_mntonname ||
+            std::string_view(sfs.f_fstypename) != "msdos")
+            return std::unexpected(targetVolume +
+                                   " is no longer a mounted RPI-RP2 volume -- "
+                                   "refusing to write the image anywhere else");
+    }
+#else
+    const std::string& targetVolume = volume;
+#endif
+
+    const auto dst = std::filesystem::path(targetVolume) / src.filename();
     std::filesystem::copy_file(src, dst,
                                std::filesystem::copy_options::overwrite_existing, ec);
-    if (ec) return std::unexpected("copy to " + volume + " failed: " + ec.message());
+    if (ec) return std::unexpected("copy to " + targetVolume + " failed: " + ec.message());
+
+#if defined(__APPLE__)
+    // Verify the copy while it is still readable from the page cache, then
+    // unmount, which flushes every dirty page to the device. A clean unmount
+    // subsumes the fsync below (unmount semantics: all dirty data reaches the
+    // device or the unmount errors), so success here is the same durability
+    // guarantee by a different call. The bootrom usually wins this unmount --
+    // the flush delivers its last block and it reboots mid-detach -- which is
+    // exactly why the nobrowse remount above, not this call, is what keeps
+    // the notification away. Any failure other than a size mismatch falls
+    // through to the fsync path, whose rules understand a vanished
+    // destination.
+    {
+        std::error_code copiedEc;
+        const auto copiedSize = std::filesystem::file_size(dst, copiedEc);
+        if (!copiedEc && copiedSize != srcSize)
+            return std::unexpected(
+                "the copied image is the wrong size; the write did not complete");
+        if (!copiedEc && unmountVolumeGracefully(targetVolume)) return {};
+    }
+#endif
 
 #if !defined(_WIN32)
     // copy_file() returning does NOT mean the image is on the board. MEASURED,
@@ -531,7 +915,7 @@ std::expected<void, std::string> copyToVolume(const std::filesystem::path& src,
     // fsync'ing the former is the classic half of this recipe that people get
     // wrong.
     if (auto flushed = flushToDevice(dst); !flushed)
-        return std::unexpected("could not flush the image to " + volume + ": " +
+        return std::unexpected("could not flush the image to " + targetVolume + ": " +
                                flushed.error());
 #endif
 

@@ -100,6 +100,17 @@ TEST_CASE("isUsbSerialPortName accepts port names and nothing else") {
     CHECK_FALSE(isUsbSerialPortName("ttyACM0x"));
     CHECK_FALSE(isUsbSerialPortName("ttyACM 0"));
     CHECK_FALSE(isUsbSerialPortName("xttyACM0"));
+
+    // The macOS spellings. The suffix is driver-chosen, so only its PRESENCE
+    // is checked -- but it must be present: a bare prefix is not a name macOS
+    // produces, and accepting one would be the ttyACM-prefix mistake above
+    // with a cu. in front of it. Bluetooth's cu.* nodes are not USB serial
+    // ports and must not spend a bounded port question.
+    CHECK(isUsbSerialPortName("cu.usbmodem14201"));
+    CHECK(isUsbSerialPortName("cu.usbserial-0001"));
+    CHECK_FALSE(isUsbSerialPortName("cu.usbmodem"));
+    CHECK_FALSE(isUsbSerialPortName("cu.usbserial"));
+    CHECK_FALSE(isUsbSerialPortName("cu.Bluetooth-Incoming-Port"));
 }
 
 // ---------------------------------------------------------------------------

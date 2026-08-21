@@ -4,6 +4,11 @@
 #include <fstream>
 #include <string_view>
 
+#if defined(__APPLE__)
+  #include <CoreFoundation/CoreFoundation.h>
+  #include <IOKit/IOKitLib.h>
+#endif
+
 namespace fwog {
 
 std::optional<CpuPortRecord> usbDeviceToRecord(UsbKind kind,
@@ -18,6 +23,19 @@ std::optional<CpuPortRecord> usbDeviceToRecord(UsbKind kind,
         // is what gets copied to. An RP2040 in its bootrom with no mount yet
         // (still enumerating, or no letter assigned) tells us nothing usable.
         if (volume.empty()) return std::nullopt;
+
+        // fwfinder's macOS backend answers "/dev/diskN" -- the raw disk, not a
+        // mount point -- while diskutil has not yet reported where (or
+        // whether) the volume mounted. That is the same "tells us nothing
+        // usable" state as an empty volume, but spelled so that it used to
+        // pass the emptiness check and flow into classifyVolumes(), where it
+        // string-matches no real mount and turns a hub-resolved drive into a
+        // ForeignMounted refusal -- or, under fwogcli --yes, into a write that
+        // skipped the very guard the classification exists to apply. A device
+        // node is never something to copy a file into, on any platform this
+        // builds for, so refuse it here the same way an unknown hub port is
+        // refused: say nothing rather than guess.
+        if (volume.rfind("/dev/", 0) == 0) return std::nullopt;
 
         // An unrecognised hub port is left unattributed rather than guessed.
         // This is the whole safety property of the structural pass: it says
@@ -104,8 +122,96 @@ std::string productFromSysfs(const std::string& rawSyspath,
 
 } // namespace detail
 
+#if defined(__APPLE__)
+namespace {
+
+/// The device's own iProduct string from the IO registry, or "" for "could
+/// not tell". fwfinder_mac.cpp sets `_raw` to the empty string, so the sysfs
+/// route productStringOf() takes on Linux has nothing to key from here; what a
+/// USBDevice does carry is vid/pid/serial, and that triple is how the device
+/// is found again in the registry. MEASURED against the attached FreeWili
+/// 1-OG: fwfinder's display name for its DISPLAY CPU is "FreeWili OG FWOG
+/// display ..." -- manufacturer prefixed, exactly the Linux defect -- and the
+/// registry's "USB Product Name" is the bare "FWOG display ..." the prefix
+/// tests downstream are anchored on.
+///
+/// The serial requirement is strict when a serial exists: with two identical
+/// boards attached, vid/pid alone names both, and answering with whichever
+/// enumerated first would attribute one board's product string to the other.
+/// A device that publishes no serial is matched by vid/pid only if it is the
+/// ONLY match, same reasoning in a different key.
+///
+/// UNTESTED, knowingly: the choose-among-candidates rule is pure logic, but
+/// every value it decides on comes straight out of the IO registry, and a
+/// seam injected here would mock the only thing the function does. The rule
+/// is not unpinned -- the Linux sibling, detail::productFromSysfs with its
+/// injected reader, carries the tested version -- so this stays fused to
+/// IOKit and says so rather than staying silent. Board-verified on macOS
+/// 2026-08-14, pre-v2 rebase; build+tests re-verified on the rebased branch,
+/// the flash has not been re-run.
+std::string ioKitUsbProductString(uint16_t vid, uint16_t pid, const std::string& serial)
+{
+    CFMutableDictionaryRef match = IOServiceMatching("IOUSBHostDevice");
+    if (!match) return {};
+    const int32_t v = vid, p = pid;
+    CFNumberRef vn = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &v);
+    CFNumberRef pn = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &p);
+    CFDictionarySetValue(match, CFSTR("idVendor"), vn);
+    CFDictionarySetValue(match, CFSTR("idProduct"), pn);
+    CFRelease(vn);
+    CFRelease(pn);
+
+    io_iterator_t it = IO_OBJECT_NULL;
+    // The call consumes `match`, success or not.
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, match, &it) != KERN_SUCCESS)
+        return {};
+
+    const auto strProp = [](io_object_t svc, CFStringRef key) -> std::string {
+        CFTypeRef ref = IORegistryEntryCreateCFProperty(svc, key, kCFAllocatorDefault, 0);
+        if (!ref) return {};
+        std::string out;
+        if (CFGetTypeID(ref) == CFStringGetTypeID()) {
+            // A USB string descriptor caps at 126 UTF-16 units; 512 bytes holds
+            // any honest answer in UTF-8.
+            char buf[512] = {};
+            if (CFStringGetCString(static_cast<CFStringRef>(ref), buf, sizeof(buf),
+                                   kCFStringEncodingUTF8))
+                out = buf;
+        }
+        CFRelease(ref);
+        return out;
+    };
+
+    std::string found;
+    int vidPidMatches = 0;
+    for (io_object_t dev; (dev = IOIteratorNext(it)) != IO_OBJECT_NULL;
+         IOObjectRelease(dev)) {
+        ++vidPidMatches;
+        if (!serial.empty() && strProp(dev, CFSTR("USB Serial Number")) != serial)
+            continue;
+        found = strProp(dev, CFSTR("USB Product Name"));
+        if (!serial.empty()) break;   // the one device this triple names
+    }
+    IOObjectRelease(it);
+
+    if (serial.empty() && vidPidMatches != 1) return {};   // ambiguous: no answer
+    return found;
+}
+
+} // namespace
+#endif
+
 std::string productStringOf(const Fw::USBDevice& usb)
 {
+#if defined(__APPLE__)
+    // Falls back rather than blanking, same rule as every step of the sysfs
+    // path below: `usb.name` is what this field has always contained, so a
+    // registry miss returns to the status quo instead of newly making
+    // ogBootloaderState() answer Unknown.
+    if (auto s = ioKitUsbProductString(usb.vid, usb.pid, usb.serial); !s.empty())
+        return s;
+    return usb.name;
+#else
     return detail::productFromSysfs(usb._raw, usb.name,
         [](const std::string& path) -> std::optional<std::string> {
             std::ifstream f(path, std::ios::binary);
@@ -118,6 +224,7 @@ std::string productStringOf(const Fw::USBDevice& usb)
             f.read(buf.data(), buf.size());
             return std::string(buf.data(), static_cast<std::size_t>(f.gcount()));
         });
+#endif
 }
 
 std::vector<CpuPortRecord> toCpuPortRecords(const Fw::FreeWiliDevice& device)

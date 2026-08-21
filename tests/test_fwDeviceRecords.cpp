@@ -69,6 +69,24 @@ TEST_CASE("a bootrom drive with no mount point yet produces no record") {
     CHECK_FALSE(usbDeviceToRecord(UsbKind::MassStorage, "", "", kHubPortMain, "").has_value());
 }
 
+TEST_CASE("a raw device node is not a volume, and produces no record") {
+    // fwfinder's macOS backend reports "/dev/diskN" -- the disk itself, not a
+    // mount point -- while diskutil has not yet said where the volume mounted.
+    // That is the not-yet-mounted state above wearing a non-empty spelling: a
+    // device node is never something to copy a file into, so it must be
+    // refused the same way, not passed downstream to string-match against
+    // real mount paths and turn a hub-resolved drive into a refusal.
+    CHECK_FALSE(usbDeviceToRecord(UsbKind::MassStorage, "", "RP2 Boot",
+                                  kHubPortMain, "/dev/disk4").has_value());
+    CHECK_FALSE(usbDeviceToRecord(UsbKind::MassStorage, "", "",
+                                  kHubPortDisplay, "/dev/disk5s1").has_value());
+    // The real mount-point spellings stay accepted on every platform.
+    CHECK(usbDeviceToRecord(UsbKind::MassStorage, "", "",
+                            kHubPortMain, "/Volumes/RPI-RP2").has_value());
+    CHECK(usbDeviceToRecord(UsbKind::MassStorage, "", "",
+                            kHubPortMain, "/run/media/you/RPI-RP2").has_value());
+}
+
 TEST_CASE("mass storage on a hub port that is neither CPU is never attributed") {
     // An SD card reader, a FREE-WILi2 layout, a drive on a plain external hub.
     // The structural pass says where a CPU is or says nothing; it must never

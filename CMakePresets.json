@@ -27,6 +27,22 @@
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
     },
     {
+      "name": "mac-clang-debug",
+      "displayName": "macOS Clang Debug",
+      "generator": "Ninja",
+      "binaryDir": "build/${presetName}",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+    },
+    {
+      "name": "mac-clang-release",
+      "displayName": "macOS Clang Release",
+      "generator": "Ninja",
+      "binaryDir": "build/${presetName}",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
+    },
+    {
       "name": "wasm-release",
       "displayName": "Emscripten Release (UNVERIFIED -- never compiled)",
       "generator": "Ninja",
@@ -41,12 +57,18 @@
     { "name": "win-msvc-debug",   "configurePreset": "win-msvc-debug" },
     { "name": "win-msvc-release", "configurePreset": "win-msvc-release" },
     { "name": "linux-gcc-release","configurePreset": "linux-gcc-release" },
+    { "name": "mac-clang-debug",  "configurePreset": "mac-clang-debug" },
+    { "name": "mac-clang-release","configurePreset": "mac-clang-release" },
     { "name": "wasm-release",     "configurePreset": "wasm-release" }
   ],
   "testPresets": [
     { "name": "win-msvc-debug",   "configurePreset": "win-msvc-debug",
       "output": { "outputOnFailure": true } },
     { "name": "linux-gcc-release","configurePreset": "linux-gcc-release",
+      "output": { "outputOnFailure": true } },
+    { "name": "mac-clang-debug",  "configurePreset": "mac-clang-debug",
+      "output": { "outputOnFailure": true } },
+    { "name": "mac-clang-release","configurePreset": "mac-clang-release",
       "output": { "outputOnFailure": true } }
   ]
 }

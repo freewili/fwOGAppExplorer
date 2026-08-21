@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -22,6 +24,13 @@
   #include <unistd.h>
   #include <chrono>
   #include <thread>
+  #if defined(__APPLE__)
+    // IOKit's serial registry: the macOS answer to /sys/class/tty, and the
+    // only place a /dev/cu.* node's USB vendor/product identity can be read.
+    #include <CoreFoundation/CoreFoundation.h>
+    #include <IOKit/IOKitLib.h>
+    #include <IOKit/serial/IOSerialKeys.h>
+  #endif
 #endif
 
 namespace fwog {
@@ -141,6 +150,17 @@ std::string usbIdForSysfsTtyDir(const std::filesystem::path& sysClassTtyEntry)
 
 bool isUsbSerialPortName(std::string_view name)
 {
+    // The macOS spellings. A CDC-ACM device's callout node is
+    // cu.usbmodem<suffix> and a vendor-driver serial's is cu.usbserial<suffix>
+    // (the suffix conventionally starts with '-', but it is driver-chosen and
+    // not worth matching on). The suffix must be present: a bare "cu.usbmodem"
+    // is not a name macOS produces, and accepting it would let a lookalike
+    // through on the strength of its prefix alone. cu.* rather than tty.* on
+    // purpose -- the callout device opens without waiting for carrier, which
+    // is what every open() in this project wants.
+    if (name.rfind("cu.usbmodem", 0) == 0)  return name.size() > 11;
+    if (name.rfind("cu.usbserial", 0) == 0) return name.size() > 12;
+
     std::string_view digits;
     if (name.rfind("ttyACM", 0) == 0)      digits = name.substr(6);
     else if (name.rfind("ttyUSB", 0) == 0) digits = name.substr(6);
@@ -308,6 +328,131 @@ std::vector<SerialPortInfo> listSerialPortInfo() { return {}; }
 
 std::optional<std::string> readSerialLine(const std::string&, int) { return std::nullopt; }
 
+#elif defined(__APPLE__)
+
+// The IOKit registry, not a /dev glob. A directory listing of /dev could name
+// the ports but could never say WHICH USB device a port belongs to, and that
+// identity is this function's whole reason to exist -- an empty usbId reads
+// downstream as "identity unknown", which the header calls out as the silent
+// failure mode. IOSerialBSDClient nodes carry the callout path, and their
+// ancestor chain in the service plane carries bInterfaceNumber (interface
+// node), idVendor/idProduct and locationID (device node), which
+// IORegistryEntrySearchCFProperty(kIORegistryIterateParents) reads without
+// hand-walking the tree.
+//
+// The id is built by makeLinuxUsbId() ON PURPOSE: "usb:vXXXXpYYYY[inZZ]:bus"
+// is the one non-Windows shape looksLikeProberUsbId() parses, and inventing a
+// macOS-only spelling would mean teaching that predicate a third branch for
+// zero information gained. locationID stands in for the sysfs bus id -- like
+// the bus id it names one physical port, it is never matched on, and it keeps
+// two identical boards' ids distinct.
+//
+// BOARD-VERIFIED ON MACOS 2026-08-14, against a real FreeWili 1-OG -- that
+// run predates the v2 rebase; on the rebased branch only the build and test
+// suite have been re-verified, the flash has not been re-run.
+
+namespace {
+
+std::optional<uint32_t> ioNumberProp(io_object_t svc, CFStringRef key)
+{
+    CFTypeRef ref = IORegistryEntrySearchCFProperty(
+        svc, kIOServicePlane, key, kCFAllocatorDefault,
+        kIORegistryIterateRecursively | kIORegistryIterateParents);
+    if (!ref) return std::nullopt;
+    std::optional<uint32_t> out;
+    if (CFGetTypeID(ref) == CFNumberGetTypeID()) {
+        int64_t v = 0;
+        if (CFNumberGetValue(static_cast<CFNumberRef>(ref), kCFNumberSInt64Type, &v)
+            && v >= 0)
+            out = static_cast<uint32_t>(v);
+    }
+    CFRelease(ref);
+    return out;
+}
+
+std::string ioStringProp(io_object_t svc, CFStringRef key)
+{
+    CFTypeRef ref = IORegistryEntryCreateCFProperty(svc, key, kCFAllocatorDefault, 0);
+    if (!ref) return {};
+    std::string out;
+    if (CFGetTypeID(ref) == CFStringGetTypeID()) {
+        char buf[512] = {};
+        if (CFStringGetCString(static_cast<CFStringRef>(ref), buf, sizeof(buf),
+                               kCFStringEncodingUTF8))
+            out = buf;
+    }
+    CFRelease(ref);
+    return out;
+}
+
+std::string hexField(uint32_t v, int digits)
+{
+    char buf[16] = {};
+    std::snprintf(buf, sizeof(buf), "%0*x", digits, v);
+    return buf;
+}
+
+} // namespace
+
+std::vector<SerialPortInfo> listSerialPortInfo()
+{
+    std::vector<SerialPortInfo> ports;
+
+    CFMutableDictionaryRef match = IOServiceMatching(kIOSerialBSDServiceValue);
+    if (!match) return ports;   // could not ask: fail closed, same as Linux
+    CFDictionarySetValue(match, CFSTR(kIOSerialBSDTypeKey),
+                         CFSTR(kIOSerialBSDAllTypes));
+
+    io_iterator_t it = IO_OBJECT_NULL;
+    // The call consumes `match`, success or not.
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, match, &it) != KERN_SUCCESS)
+        return ports;
+
+    for (io_object_t svc; (svc = IOIteratorNext(it)) != IO_OBJECT_NULL;
+         IOObjectRelease(svc)) {
+        const std::string dev = ioStringProp(svc, CFSTR(kIOCalloutDeviceKey));
+        if (dev.empty()) continue;
+
+        // Same gate the Linux branch applies to /sys/class/tty entries: only
+        // names shaped like a USB serial port. Bluetooth SPP ports
+        // (cu.Bluetooth-*), debug consoles and the like are not candidates and
+        // must not spend one of identifyCpus()'s bounded port questions.
+        const std::string name = std::filesystem::path(dev).filename().string();
+        if (!isUsbSerialPortName(name)) continue;
+
+        // The registry can outrun devfs the same way sysfs outruns udev; a
+        // path that cannot be opened is not worth returning. See the Linux
+        // branch for the full argument.
+        std::error_code existsEc;
+        if (!std::filesystem::exists(dev, existsEc) || existsEc) continue;
+
+        LinuxUsbAttrs attrs;
+        if (const auto vid = ioNumberProp(svc, CFSTR("idVendor")))
+            attrs.idVendor = hexField(*vid, 4);
+        if (const auto pid = ioNumberProp(svc, CFSTR("idProduct")))
+            attrs.idProduct = hexField(*pid, 4);
+        // bInterfaceNumber is deliberately NOT reported, and this is the one
+        // place this branch knowingly diverges from Linux. MEASURED against an
+        // attached FreeWili 1-OG: the ancestor interface of an IOSerialBSDClient
+        // here is the CDC DATA interface -- both 093C CDC ports read back
+        // bInterfaceNumber=1 -- where Linux's ttyACM reports the COMM
+        // interface, 0. Reporting the honest "01" would make
+        // looksLikeProberUsbId() refuse the prober's own port (it accepts
+        // interface 00 or none), and mapping 1 back to 0 would be inventing a
+        // number the registry did not say. Omitting it loses nothing that
+        // property exists to protect: the rule's target is pico_stdio_usb's
+        // Reset interface (2), which never owns a serial node on macOS, so
+        // there is no wrong-interface port here to refuse.
+        if (const auto loc = ioNumberProp(svc, CFSTR("locationID")))
+            attrs.busId = hexField(*loc, 8);
+        // makeLinuxUsbId() returns "" unless vendor+product both read back as
+        // clean hex, and "" is the honest answer then -- identical to Linux.
+        ports.push_back(SerialPortInfo{ dev, makeLinuxUsbId(attrs) });
+    }
+    IOObjectRelease(it);
+    return ports;
+}
+
 #else
 
 // WAS UNVERIFIED, NOW MEASURED. When this branch was written no Linux
@@ -365,6 +510,16 @@ std::vector<SerialPortInfo> listSerialPortInfo()
     }
     return ports;
 }
+
+#endif   // per-platform listSerialPortInfo
+
+// One termios implementation for every POSIX platform: measured on Linux
+// against an attached board (see the branch comment above), and since RUN on
+// macOS too, not merely compiled -- the 1200-baud touch reset a real board
+// from a Mac on 2026-08-14, on the /dev/cu.* callout node the mac branch
+// lists. That run predates the v2 rebase; on the rebased branch only the
+// build and test suite have been re-verified, the touch has not been re-run.
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
 
 std::optional<std::string> readSerialLine(const std::string& port, int timeoutMs)
 {

@@ -32,6 +32,27 @@ TEST_CASE("unescapeMount leaves a non-octal digit after the backslash alone") {
     CHECK(detail::unescapeMount("/media/foo\\099bar") == "/media/foo\\099bar");
 }
 
+TEST_CASE("escapeMount encodes exactly the characters the kernel escapes") {
+    // A path with none of the four is untouched -- most mount points.
+    CHECK(detail::escapeMount("/Volumes/RPI-RP2") == "/Volumes/RPI-RP2");
+    CHECK(detail::escapeMount("a b") == "a\\040b");
+    CHECK(detail::escapeMount("a\tb") == "a\\011b");
+    CHECK(detail::escapeMount("a\nb") == "a\\012b");
+    CHECK(detail::escapeMount("a\\b") == "a\\134b");
+}
+
+TEST_CASE("escapeMount and unescapeMount round-trip the second-volume path") {
+    // The path the macOS readMounts comment stakes its claim on: a second
+    // bootrom volume with the same label mounts at "/Volumes/RPI-RP2 1", and
+    // the space must survive the render into /proc/mounts's line format and
+    // back out of it -- truncating at the space would name the OTHER board's
+    // volume.
+    CHECK(detail::escapeMount("/Volumes/RPI-RP2 1") == "/Volumes/RPI-RP2\\0401");
+    CHECK(detail::unescapeMount(detail::escapeMount("/Volumes/RPI-RP2 1")) ==
+          "/Volumes/RPI-RP2 1");
+    CHECK(detail::unescapeMount(detail::escapeMount("a \t\n\\z")) == "a \t\n\\z");
+}
+
 // --- parseMountLine ---------------------------------------------------------
 
 TEST_CASE("parseMountLine splits the three fields it needs") {
@@ -300,7 +321,7 @@ TEST_CASE("unmountedBootselNotice explains a BOOTSEL device nothing mounted") {
     // The case this exists for: findRpiRp2Volumes() returns nothing while a
     // board sits in BOOTSEL, which is otherwise indistinguishable from no
     // board being attached at all.
-    const auto s = detail::unmountedBootselNotice(1, 0);
+    const auto s = detail::unmountedBootselNotice(1, 0, detail::MountRemedy::Udisks);
     CHECK_FALSE(s.empty());
     CHECK(s.find("BOOTSEL") != std::string::npos);
     CHECK(s.find("not mounted") != std::string::npos);
@@ -324,10 +345,10 @@ TEST_CASE("unmountedBootselNotice's remedy is one the plural case can actually f
     // mounts the same drive twice while the other stays invisible. A remedy the
     // situation cannot satisfy is worse than no remedy: it reads as the app
     // being broken.
-    const auto one = detail::unmountedBootselNotice(1, 0);
+    const auto one = detail::unmountedBootselNotice(1, 0, detail::MountRemedy::Udisks);
     CHECK(one.find("udisksctl mount -b /dev/disk/by-label/RPI-RP2") != std::string::npos);
 
-    const auto two = detail::unmountedBootselNotice(2, 0);
+    const auto two = detail::unmountedBootselNotice(2, 0, detail::MountRemedy::Udisks);
     // Device nodes, which are distinct, plus the command that lists them.
     CHECK(two.find("lsblk") != std::string::npos);
     CHECK(two.find("udisksctl mount -b /dev/<node>") != std::string::npos);
@@ -348,7 +369,8 @@ TEST_CASE("the remedy follows the number of DEVICES carrying the label, not the 
     // command names one of the two at random: half the time it mounts the drive
     // the user wanted, and half the time it returns "already mounted at
     // .../RPI-RP21" and the user is back where they started.
-    const auto twoDevicesOneMounted = detail::unmountedBootselNotice(2, 1);
+    const auto twoDevicesOneMounted =
+        detail::unmountedBootselNotice(2, 1, detail::MountRemedy::Udisks);
 
     // Singular situation -- one drive really is missing...
     CHECK(twoDevicesOneMounted.find("A CPU is in BOOTSEL") != std::string::npos);
@@ -364,7 +386,32 @@ TEST_CASE("the remedy follows the number of DEVICES carrying the label, not the 
 
     // And the one-device case is unaffected: there the symlink is unambiguous
     // and the short command is the better answer.
-    CHECK(detail::unmountedBootselNotice(1, 0).find("lsblk") == std::string::npos);
+    CHECK(detail::unmountedBootselNotice(1, 0, detail::MountRemedy::Udisks)
+              .find("lsblk") == std::string::npos);
+}
+
+TEST_CASE("unmountedBootselNotice's macOS remedy names tools macOS actually has") {
+    // The Linux remedy strands a mac user at exactly the moment the notice
+    // exists to rescue them: udisksctl and lsblk do not exist there. Same
+    // shape as the udisks tests above -- a short by-name command when it is
+    // unambiguous, disk identifiers plus the warning when two drives share
+    // the name.
+    const auto one = detail::unmountedBootselNotice(1, 0, detail::MountRemedy::Diskutil);
+    CHECK(one.find("diskutil mount RPI-RP2") != std::string::npos);
+    CHECK(one.find("udisksctl") == std::string::npos);
+
+    const auto two = detail::unmountedBootselNotice(2, 0, detail::MountRemedy::Diskutil);
+    CHECK(two.find("diskutil list") != std::string::npos);
+    CHECK(two.find("diskutil mount /dev/<identifier>") != std::string::npos);
+    CHECK(two.find("Do not mount by the name RPI-RP2") != std::string::npos);
+    CHECK(two.find("for example: diskutil mount RPI-RP2") == std::string::npos);
+    CHECK(two.find("lsblk") == std::string::npos);
+
+    // The count logic is shared, not per-remedy: two devices with one mounted
+    // still gets the singular situation and the plural remedy.
+    const auto mixed = detail::unmountedBootselNotice(2, 1, detail::MountRemedy::Diskutil);
+    CHECK(mixed.find("A CPU is in BOOTSEL") != std::string::npos);
+    CHECK(mixed.find("diskutil list") != std::string::npos);
 }
 
 // --- countBootselDevices ----------------------------------------------------

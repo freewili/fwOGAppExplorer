@@ -58,6 +58,10 @@ on first launch, so the apps are there without anything being bundled. Drop a
 development packages, it has one shared-library dependency Windows does not, and
 serial-port permissions usually need a one-time setup step.
 
+**macOS** works and has flashed a real board, also from source — see
+[macOS](#macos). It needs nothing beyond CMake and Ninja, and it has the
+smoothest permission story of the three platforms.
+
 ## What is new in v2
 
 | | |
@@ -247,6 +251,7 @@ with the MSVC environment loaded (the "x64 Native Tools Command Prompt") — the
 preset fails loudly rather than silently falling back to a GCC on `PATH`.
 
 Presets: `win-msvc-debug`, `win-msvc-release`, `linux-gcc-release`,
+`mac-clang-debug`, `mac-clang-release`,
 `wasm-release`.
 
 `linux-gcc-release` is a real target and has its own section below — it builds,
@@ -503,6 +508,16 @@ The Windows zip is assembled by the same three steps by hand, and if one
 platform ever gets a packaging target the other should get it in the same
 change — two release processes that drift is how the two stop matching.
 
+macOS does ship a script — [`packaging/make_mac_app.sh`](packaging/make_mac_app.sh)
+— and that is not the drift this rule forbids. The script does not assemble a
+release layout; it builds the `.app` wrapper that macOS *structurally requires*
+(Gatekeeper's stapler refuses to attach a notarization ticket to a bare Mach-O,
+and Finder drags a Terminal window up behind one — see [Signing and
+distribution](#signing-and-distribution)). Windows and Linux have no equivalent
+requirement, so there is no sibling target to keep in step. The macOS release
+zip around that bundle is still assembled by hand, by the same steps as the
+other two.
+
 ### The `.desktop` file
 
 [`packaging/fwOGAppExplorer.desktop`](packaging/fwOGAppExplorer.desktop) is not
@@ -553,6 +568,140 @@ install**; and the `LegacyDirect` restore. Timings and serial numbers are in
   from the protocol and from SDL's source, and has not been watched happening.
 - **Any other machine.** Everything here is one build on one distribution. The
   glibc floor above is the honest way to reason about the rest.
+
+## macOS
+
+macOS builds, tests green, runs, and **has flashed a real board** — including
+the one path Linux never exercised. What that claim rests on, and its one
+caveat, is spelled out in [What is and is not verified on
+macOS](#what-is-and-is-not-verified-on-macos) at the end of this section.
+
+### Building on macOS
+
+Requires Xcode command line tools plus CMake and Ninja (`brew install cmake
+ninja`). Then:
+
+```sh
+cmake --preset mac-clang-release
+cmake --build --preset mac-clang-release
+ctest  --preset mac-clang-release
+```
+
+Measured here: Apple clang 21.0.0 (clang-2100.1.1.101), arm64, macOS 26.6
+(SDK 26.5), CMake 4.4.2, Ninja 1.13.2. The build **configures, builds and
+links without complaint** — warning-clean, both `mac-clang-release` and
+`mac-clang-debug` — and the complete test suite passes: **580 cases / 2337
+assertions**. `fwogcli` builds and runs from the same presets.
+
+Output lands in `build/mac-clang-release/`. `freewili-finder` has a native IOKit
+backend, so unlike Linux there is no `libudev` equivalent to install — the USB
+enumeration, serial identity reads (`fwSerialPorts.cpp`) and BOOTSEL device
+counting (`fwVolume.cpp`) all go through IOKit and CoreFoundation, which ship
+with the OS.
+
+### What macOS gets for free that Linux does not
+
+- **No serial-port permission setup.** `/dev/cu.*` nodes are world-writable by
+  default; there is no `dialout`/`uucp` group to join and no udev rule to write.
+- **The `RPI-RP2` volume auto-mounts**, under `/Volumes/RPI-RP2` (a second board
+  mounts at `/Volumes/RPI-RP2 1` — the space is handled). No `udisksctl` step.
+- **libcurl ships with the OS** (`/usr/lib/libcurl.4.dylib`), so the remote
+  catalog works without installing anything. It is still `dlopen`ed, never
+  linked, same as Linux.
+- **A leaner dependency truth.** `otool -L` reports only OS-provided libraries
+  and frameworks — there is no third-party shared-library dependency at all,
+  which makes the "one executable" claim closer to the Windows truth than the
+  Linux one.
+
+### Where things land
+
+Settings and the catalog cache go to `~/Library/Application Support/
+fwOGAppExplorer/` — the platform's convention, where Linux uses
+`~/.local/share`. An absolute `$XDG_DATA_HOME`, if you set one, still wins on
+both. The `catalog/` folder is looked for beside the executable, same as every
+platform.
+
+### Signing and distribution
+
+The build output is a plain executable, ad-hoc signed by the linker as arm64
+requires — fine for local use. For distribution, wrap it in the minimal `.app`
+bundle (a bare Mach-O double-clicked in Finder drags a Terminal window up
+behind it, and `stapler` refuses to staple anything that is not a bundle):
+
+```sh
+packaging/make_mac_app.sh                 # bundle + Developer ID signature
+ditto -c -k --keepParent build/mac-clang-release/fwOGAppExplorer.app /tmp/fwog.zip
+xcrun notarytool submit /tmp/fwog.zip --keychain-profile <profile> --wait
+xcrun stapler staple build/mac-clang-release/fwOGAppExplorer.app
+```
+
+This flow has been run end to end: the bundle notarizes (`status: Accepted`),
+staples, and `spctl --assess` answers `accepted, source=Notarized Developer
+ID`. It needs a **Developer ID Application** certificate — an Apple Development
+certificate signs a binary that runs locally but will not pass Gatekeeper on
+another machine — and a `notarytool store-credentials` profile.
+
+One consequence of the bundle worth knowing: `catalog/` sits beside the
+executable on every platform, and inside a bundle "beside the executable"
+means `fwOGAppExplorer.app/Contents/MacOS/catalog/`. The "Open catalog folder"
+button opens the right place; finding it by hand takes Finder's "Show Package
+Contents".
+
+And one consequence worth stating before someone hits it: in a **signed**
+bundle that folder is sealed resources, so dropping a `.uf2` into it after
+signing breaks the code seal (`codesign --verify` fails from then on), and a
+quarantined app run straight from `~/Downloads` executes under App
+Translocation, where the folder is read-only entirely. The drop-a-file-next-
+to-the-exe model, which is exactly right on Windows and Linux, does not
+transfer to a signed mac bundle. Since v2 the remote catalog covers the
+everyday case without touching the bundle; local `.uf2`s work fine with the
+unbundled binary. Moving the local catalog to per-user data on macOS is the
+platform-correct future answer, and is recorded here rather than smuggled
+into a port.
+
+`fwogcli` stays a bare executable — a terminal program gains nothing from a
+bundle, and codesigning a bare Mach-O for local use is exactly what the linker
+already did. A macOS release ships it beside the `.app`, the same way the Linux
+tarball seats it beside the GUI binary.
+
+### What is and is not verified on macOS
+
+**Verified against the real board** (an attached FreeWili 1-OG, serial FW4300,
+2026-08-14): device detection and CPU identification by hub position; product
+strings read from the IO registry; and the **App Explorer `OgApp` flash end to
+end** — the 1200-baud touch, `RPI-RP2` volume discovery, the copy with
+`F_FULLFSYNC`, MAIN provisioned, and the display bootloader carrying the
+embedded DISPLAY image across the inter-CPU link, confirmed by both CPUs
+re-enumerating with the new app's product strings. The signed `.app` notarized
+and stapled. Timings and serials are in
+[`docs/hardware-verification.md`](docs/hardware-verification.md).
+
+**Dates matter here, so:** that board pass ran on the pre-v2 codebase, and
+this branch was then rebased onto v2 — which rewrote the flash sequencing
+(`fwFlashPrep`) and the catalog around the same platform code. The rebase was
+re-verified in two stages, both in the ledger: first the board-free evidence
+(warning-clean build on both presets, the full suite — **580 cases / 2337
+assertions** — `fwogcli` on an empty bus, the `.app` packaging, a first-launch
+remote-catalog fetch over the `dlopen`ed libcurl), and then **the flash was
+re-run against v2's sequencing on the same board**: `fwogcli flash` — its
+first board flash ever driven from macOS — with an image downloaded and
+hash-verified from the published catalog, both bootrom volumes mounted at once
+(`/Volumes/RPI-RP2` and `/Volumes/RPI-RP2 1`, the space case, on real
+hardware), and both CPUs re-enumerating as the new app.
+
+**Not verified:**
+
+- The display-bootloader install and `LegacyDirect` restore flows (the attached
+  board already had its bootloader), the CPU-prober recovery flow, and two
+  boards at once.
+- The GUI flash **on the rebased build** — the post-rebase flash above went
+  through `fwogcli`, which drives the identical engine; the GUI's own
+  end-to-end run is the 2026-08-14 (pre-rebase) evidence.
+- **Any other machine.** Everything here is one arm64 Mac; no Intel build has
+  been run. The bundle declares macOS 12.0 as its floor
+  (`LSMinimumSystemVersion` in `make_mac_app.sh`), and every API the port
+  uses predates that by years — but 12.0 is a declaration, not a measurement,
+  for the same reason the Linux section's glibc floor is one.
 
 ## Hardware verification status
 

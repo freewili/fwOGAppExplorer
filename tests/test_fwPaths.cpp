@@ -9,6 +9,23 @@
   #include <limits.h>
   #include <pwd.h>
   #include <unistd.h>
+  #if defined(__APPLE__)
+    #include <mach-o/dyld.h>
+  #endif
+
+namespace {
+/// Where userDataDir() puts per-user data under a given home directory --
+/// the platform's own convention, mirrored from fwPaths.cpp so the
+/// expectations below state it once.
+std::filesystem::path dataDirUnder(const std::filesystem::path& home)
+{
+#if defined(__APPLE__)
+    return home / "Library" / "Application Support";
+#else
+    return home / ".local" / "share";
+#endif
+}
+} // namespace
 #endif
 
 using namespace fwog;
@@ -165,12 +182,29 @@ TEST_CASE("exeDir names the directory that really contains this test binary") {
     CHECK(std::filesystem::exists(exeDir() / "fwog_tests"));
 }
 
+#if defined(__APPLE__)
+TEST_CASE("exeDir agrees with a direct ask of dyld") {
+    // The macOS counterpart of the /proc/self/exe cross-check below it
+    // replaces: same independent-source shape, same question. The path dyld
+    // reports is as-invoked, so it is canonicalised here exactly as
+    // fwPaths.cpp does before comparing.
+    uint32_t size = 0;
+    ::_NSGetExecutablePath(nullptr, &size);
+    REQUIRE(size > 0);
+    std::string buf(size, '\0');
+    REQUIRE(::_NSGetExecutablePath(buf.data(), &size) == 0);
+    buf.resize(std::char_traits<char>::length(buf.c_str()));
+    CHECK(exeDir() ==
+          std::filesystem::weakly_canonical(std::filesystem::path(buf)).parent_path());
+}
+#else
 TEST_CASE("exeDir agrees with a direct read of /proc/self/exe") {
     char buf[PATH_MAX] = {};
     const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
     REQUIRE(n > 0);
     CHECK(exeDir() == std::filesystem::path(std::string(buf, size_t(n))).parent_path());
 }
+#endif
 
 // A test asserting that readlink() cannot signal truncation used to live here.
 // It was deleted: it called no fwog function, so no change to fwPaths.cpp
@@ -201,7 +235,7 @@ TEST_CASE("a relative XDG_DATA_HOME is ignored, as the XDG spec requires") {
 
     const auto p = userDataDir();
     CHECK(p.is_absolute());
-    CHECK(p == scratch.path() / ".local" / "share" / "fwOGAppExplorer");
+    CHECK(p == dataDirUnder(scratch.path()) / "fwOGAppExplorer");
     // And nothing was created under the working directory on the way past:
     // honouring the relative value would have made a real directory there.
     CHECK_FALSE(std::filesystem::exists(stray.path()));
@@ -220,7 +254,7 @@ TEST_CASE("an empty XDG_DATA_HOME is treated as unset, not as the empty path") {
 
     const auto p = userDataDir();
     CHECK(p.is_absolute());
-    CHECK(p == scratch.path() / ".local" / "share" / "fwOGAppExplorer");
+    CHECK(p == dataDirUnder(scratch.path()) / "fwOGAppExplorer");
     // No "did it pollute the working directory?" check here, unlike the
     // relative-XDG case above: an empty base produces the bare name
     // "fwOGAppExplorer", and the app's own executable is called exactly that
@@ -244,7 +278,7 @@ TEST_CASE("a relative or empty HOME is ignored too, and the account database ans
 
     const auto p = userDataDir();
     CHECK(p.is_absolute());
-    CHECK(p == expectedHome / ".local" / "share" / "fwOGAppExplorer");
+    CHECK(p == dataDirUnder(expectedHome) / "fwOGAppExplorer");
     CHECK_FALSE(std::filesystem::exists(stray.path()));
 }
 

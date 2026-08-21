@@ -743,6 +743,15 @@ int App::run()
         ImGui::End();
 
         ImGui::Render();
+        // ImGui lays out in window points; with SDL_WINDOW_HIGH_PIXEL_DENSITY
+        // the renderer's output is in PIXELS, 2x the points on a Retina
+        // display -- without this scale the whole UI draws at quarter size in
+        // the corner. This is the upstream example's own recipe
+        // (example_sdl3_sdlrenderer3). A no-op at scale 1.0, which is why
+        // Windows and Linux never showed the defect.
+        const ImGuiIO& frameIo = ImGui::GetIO();
+        SDL_SetRenderScale(renderer, frameIo.DisplayFramebufferScale.x,
+                           frameIo.DisplayFramebufferScale.y);
         SDL_SetRenderDrawColor(renderer, 15, 15, 15, 255);
         SDL_RenderClear(renderer);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);

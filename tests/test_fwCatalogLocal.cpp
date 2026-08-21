@@ -322,10 +322,27 @@ TEST_CASE("a directory that does not exist caches an empty catalog without churn
     CHECK(cache.rescans() == 1);
 }
 
-TEST_CASE("files whose names differ only in case: two images on Linux, one file on Windows") {
+TEST_CASE("files whose names differ only in case are reported exactly as the filesystem stores them") {
     auto dir = freshTestDir("case-identity");
 
-#ifdef _WIN32
+#if defined(__APPLE__)
+    // macOS is the platform where case sensitivity is a PROPERTY OF THE
+    // VOLUME, not the OS: APFS defaults to case-insensitive (the Windows
+    // behaviour) but a case-sensitive APFS volume is a formatting checkbox
+    // away, and this test directory lands on whichever kind the machine has.
+    // So the expectation is read off the filesystem itself -- write both
+    // spellings, count what actually exists -- and the assertion is that
+    // loadLocalCatalog reports exactly the files that are really there,
+    // which is the invariant both fixed-expectation branches below pin.
+    writeFile(dir / "Blinky.uf2", makeUf2(1));
+    writeFile(dir / "blinky.uf2", makeUf2(2));
+    size_t onDisk = 0;
+    for ([[maybe_unused]] const auto& de : std::filesystem::directory_iterator(dir))
+        ++onDisk;
+    auto entries = loadLocalCatalog(dir);
+    REQUIRE(entries.size() == onDisk);
+    for (const auto& e : entries) CHECK(e.source == CatalogSource::Unlisted);
+#elif defined(_WIN32)
     // Windows filesystems are case-insensitive: "Blinky.uf2" and "blinky.uf2"
     // name the SAME physical file, so the second write overwrites the first
     // rather than creating a second one. This asserts that platform fact

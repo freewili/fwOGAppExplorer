@@ -591,3 +591,91 @@ Observations worth keeping:
   "wait for the drive that appeared" window; the wait now checks each arrival
   against the live hub-position identity and skips a drive that belongs to the
   other CPU (`waitForNewVolume`, fwFlashEngine.cpp).
+
+---
+
+## 2026-08-14 — macOS: the OgApp flash, end to end (VERIFIED, pre-v2 code)
+
+Board: the same FreeWili 1-OG, serial FW4300, attached to an arm64 Mac
+(macOS 26.6, Apple clang, `build/mac-clang-release`). This is the pass the
+macOS port's claims rest on, and it ran the one flow Linux never did:
+
+- **App Explorer `OgApp` flash, end to end, through the GUI** — the 1200-baud
+  touch on `cu.usbmodem*`, `RPI-RP2` discovered under `/Volumes`, the copy
+  with `F_FULLFSYNC`, MAIN provisioned, and the display bootloader carrying
+  the embedded DISPLAY image across the inter-CPU link — confirmed by both
+  CPUs re-enumerating with the new app's product strings.
+- Device detection and CPU identification by hub position, through IOKit.
+- Product strings read from the IO registry (fwfinder_mac leaves `_raw`
+  empty, so the registry is the only honest source on this platform).
+- The clean DiskArbitration unmount-before-write: "Disk Not Ejected
+  Properly" confirmed present before the fix and gone after it, on real
+  flashes.
+
+The session surfaced four defects, each fixed and re-verified on the board
+in the same session; the `fix(macos)` commit carries the measurements
+(interface numbers, the flush-is-the-trigger unmount finding).
+
+Not run on macOS in that pass: the display-bootloader install and
+`LegacyDirect` restore (the board's bootloader was already in place and
+wanted alive), the CPU-prober recovery flow, and two boards at once.
+
+## 2026-08-21 — macOS, rebased onto v2 (build and suite re-verified; flash NOT re-run)
+
+The macOS branch was rebased onto v2 — which rewrote flash sequencing
+(`fwFlashPrep`), added `fwogcli` as a full front-end, and made the remote
+catalog the first-launch default — all after the 2026-08-14 board pass.
+What a pass believed at the time is part of the record, so, explicitly:
+**every board-flash claim above was measured against pre-v2 code.**
+
+Re-verified on the rebased branch, this machine, 2026-08-21:
+
+- `mac-clang-release` and `mac-clang-debug` both configure, build and link
+  **warning-clean**; `ctest` green on both: **580 cases / 2337 assertions**.
+- `fwogcli` — its first macOS build ever — decodes the embedded entries
+  (`entries`) and walks the empty bus without error (`list`, no board
+  attached).
+- `packaging/make_mac_app.sh` produces a bundle that signs and passes
+  `codesign --verify` (ad-hoc in this session; the Developer ID + notarize
+  flow was proven 2026-08-14 and was not re-run).
+- A first launch from a clean slate seeds the v2 default catalog URL and
+  **fetches the remote catalog over the `dlopen`ed system libcurl**
+  (`apps-cache.json` written and listed).
+
+Not re-run against v2, because no board was attached to this machine at
+rebase time: **any flash**. The platform arms v2's `fwFlashPrep` calls into
+are byte-for-byte the ones the 2026-08-14 pass exercised, but this ledger
+records runs, not reasoning — the first post-rebase flash belongs in a new
+dated section here.
+
+## 2026-08-21 — macOS: the post-rebase flash, run (VERIFIED, v2 code)
+
+The section above ends by saying the first post-rebase flash belongs in a new
+dated section. This is that section, run the same day against the branch tip
+(the build the PR ships), board FW4300 attached to the same arm64 Mac -- MAIN
+chip `E4622890471F4734`, DISPLAY chip `E4622890474B4434`.
+
+The flow: `fwogcli flash ogvegas_main.uf2` -- v2's own front-end, its first
+board flash ever driven from macOS -- with the image downloaded from the
+published catalog (`docs.freewili.com/og-apps/uf2/ogvegas_main.uf2`, sha256
+and size verified against `apps.json` before use; `fwogcli info` decoded its
+embedded DISPLAY half first). Starting state: both CPUs running, display
+bootloader present.
+
+What v2's sequencing did on macOS, observed step by step: the prep parked the
+DISPLAY CPU in BOOTSEL (its drive auto-mounted at `/Volumes/RPI-RP2`), MAIN
+was touched at 1200 baud, and MAIN's drive mounted at **`/Volumes/RPI-RP2 1`**
+-- both bootrom volumes mounted simultaneously, which means the
+space-in-the-mount-path spelling escapeMount() exists for was exercised on
+real hardware, not just in its round-trip test. The copy wrote to the
+space-named volume; 24.8 s port-to-port for the 1,049,088-byte image. Both
+CPUs re-enumerated as the new app -- IO registry product strings
+`FWOG main ogvegas 001` and `FWOG display ogvegas 001` -- and the display
+bootloader still reports present.
+
+So the one caveat the two sections above carried is closed: the flash path has
+now been run against v2's `fwFlashPrep` sequencing on macOS, through the
+platform arms as this branch ships them (getmntinfo_r_np mount scan, the
+statfs re-proof before the copy, the DiskArbitration unmount-before-write).
+Run through `fwogcli`; the GUI drives the identical engine, and the GUI
+end-to-end flash remains the 2026-08-14 entry's evidence.

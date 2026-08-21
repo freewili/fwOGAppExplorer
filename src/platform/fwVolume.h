@@ -58,9 +58,26 @@ std::optional<MountLine> parseMountLine(std::string_view line);
 /// Board-ID, and must not be offered as a FreeWili to write to.
 bool isRp2BootromInfo(std::string_view infoUf2Txt);
 
+/// Which mount tooling the remedy half of unmountedBootselNotice() should
+/// name. A value rather than an #ifdef inside the function, so both wordings
+/// compile and are tested on every platform; kNativeMountRemedy below is the
+/// one decision point that picks per-OS.
+enum class MountRemedy { Udisks, Diskutil };
+
+/// The remedy this build's OS can actually follow. macOS has no udisksctl and
+/// no lsblk; Linux has no diskutil. (Windows never shows the notice --
+/// countBootselDevices() answers 0 there -- so its value is moot.)
+inline constexpr MountRemedy kNativeMountRemedy =
+#if defined(__APPLE__)
+    MountRemedy::Diskutil;
+#else
+    MountRemedy::Udisks;
+#endif
+
 /// Explain BOOTSEL devices that no mounted volume accounts for; empty when
 /// there is nothing to explain. Pure, so the wording is tested directly.
-std::string unmountedBootselNotice(int bootselDevices, size_t volumesFound);
+std::string unmountedBootselNotice(int bootselDevices, size_t volumesFound,
+                                   MountRemedy remedy = kNativeMountRemedy);
 
 /// Decode `/proc/mounts`' octal escaping of space, tab, newline and
 /// backslash (`\040`, `\011`, `\012`, `\134`). Pure, so it is testable on
@@ -68,6 +85,14 @@ std::string unmountedBootselNotice(int bootselDevices, size_t volumesFound);
 /// findRpiRp2Volumes -- is not. A malformed or truncated escape (too few
 /// digits, or a non-octal digit) is left untouched rather than guessed at.
 std::string unescapeMount(std::string_view s);
+
+/// The exact inverse: encode space, tab, newline and backslash the way the
+/// kernel writes them into `/proc/mounts`. Its only caller is the macOS
+/// readMounts, which renders getmntinfo()'s table into /proc/mounts's line
+/// format so the shared parser and filters need no second implementation --
+/// but it is pure string logic, so it lives here and the round trip is
+/// pinned by tests on every platform.
+std::string escapeMount(std::string_view s);
 
 /// Everything the Linux volume scan reads from the machine, in one injectable
 /// place -- the same discipline, and for the same reason, as ProbeIo

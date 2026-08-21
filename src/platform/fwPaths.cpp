@@ -12,6 +12,9 @@
   #include <limits.h>
   #include <pwd.h>
   #include <unistd.h>
+  #if defined(__APPLE__)
+    #include <mach-o/dyld.h>   // _NSGetExecutablePath: no /proc on macOS
+  #endif
 #endif
 
 // VERIFIED ON LINUX -- and what was OBSERVED, not merely which cases were
@@ -74,11 +77,16 @@
 //     anywhere else is not claimed; see that function for why it is kept
 //     regardless.
 //
-// NOT verified, and not claimed: any POSIX system that is not Linux. This
-// branch is Linux-shaped -- it reads /proc -- and elsewhere degrades straight
-// to the working-directory answer of last resort. The Windows branch is
-// untouched by this work and remains the reference; the one place that was
+// NOT verified, and not claimed: any POSIX system that is not Linux and not
+// macOS. The /proc-reading branch is Linux-shaped, and elsewhere degrades
+// straight to the working-directory answer of last resort. The Windows branch
+// is untouched by this work and remains the reference; the one place that was
 // tempting to change is flagged in tempDir().
+//
+// The macOS branch (_NSGetExecutablePath) is BOARD-VERIFIED as of 2026-08-14:
+// it ran inside the app for a real flash, so exeDir() found catalog/ and the
+// firmware on a Mac. That run predates the v2 rebase; on the rebased branch
+// only the build and test suite were re-verified.
 
 namespace fwog {
 namespace {
@@ -135,6 +143,29 @@ constexpr const char* kAppName = "fwOGAppExplorer";
 /// parent_path() that every caller here actually wants is unaffected, and
 /// stripping it would instead corrupt the answer for a legitimate executable
 /// whose name really does end that way.
+#if defined(__APPLE__)
+/// macOS has no /proc; dyld itself answers instead. Same contract as the Linux
+/// reader below it replaces: a complete absolute path or "cannot tell", never a
+/// guess. _NSGetExecutablePath reports the size it wanted when the buffer is
+/// too small, so unlike readlink() there is no truncation ambiguity to guard
+/// against -- the second call with the reported size either fits or fails.
+/// The path is as-invoked and may contain symlinks or "..", so it is
+/// canonicalised; weakly_canonical rather than canonical so a deleted-under-us
+/// binary degrades to the lexical answer instead of an error.
+std::filesystem::path readProcSelfExe()
+{
+    uint32_t size = 0;
+    ::_NSGetExecutablePath(nullptr, &size);           // asks for the needed size
+    if (size == 0) return {};
+    std::string buf(size, '\0');
+    if (::_NSGetExecutablePath(buf.data(), &size) != 0) return {};
+    buf.resize(std::char_traits<char>::length(buf.c_str()));
+    if (buf.empty()) return {};
+    std::error_code ec;
+    auto canon = std::filesystem::weakly_canonical(buf, ec);
+    return ec ? std::filesystem::path(std::move(buf)) : canon;
+}
+#else
 std::filesystem::path readProcSelfExe()
 {
     std::string  buf(PATH_MAX, '\0');
@@ -144,6 +175,7 @@ std::filesystem::path readProcSelfExe()
     buf.resize(static_cast<size_t>(n));
     return std::filesystem::path(std::move(buf));
 }
+#endif
 
 /// True when an environment variable holds something usable as a base
 /// directory for user data.
@@ -312,10 +344,24 @@ std::filesystem::path userDataDir()
     // and the user silently gets no saved settings and no catalog cache.
     const char* xdg  = std::getenv("XDG_DATA_HOME");
     const char* home = std::getenv("HOME");
+#if defined(__APPLE__)
+    // Same tier order as Linux below, but the per-user data directory under a
+    // home is the platform's own: ~/Library/Application Support. An explicit
+    // absolute $XDG_DATA_HOME still wins -- a user who sets it on macOS has
+    // said where they want data, and ignoring it would be inventing a rule the
+    // XDG spec does not have.
+    const auto dataDirUnder = [](const std::filesystem::path& h) {
+        return h / "Library" / "Application Support";
+    };
+#else
+    const auto dataDirUnder = [](const std::filesystem::path& h) {
+        return h / ".local" / "share";
+    };
+#endif
     if (isUsableBaseDir(xdg))       base = xdg;
-    else if (isUsableBaseDir(home)) base = std::filesystem::path(home) / ".local" / "share";
+    else if (isUsableBaseDir(home)) base = dataDirUnder(home);
     else if (auto pwHome = passwdHomeDir(); !pwHome.empty())
-                                    base = pwHome / ".local" / "share";
+                                    base = dataDirUnder(pwHome);
     else                            base = exeDir();
 #endif
 #if defined(_MSC_VER)

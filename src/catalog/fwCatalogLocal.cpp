@@ -166,8 +166,13 @@ std::string LocalCatalogCache::fingerprintOf(const std::filesystem::path& dir)
         line += sizeEc ? std::string("?")
                         : std::to_string(static_cast<unsigned long long>(size));
         line += '|';
+        // The cast is load-bearing on libc++, where file_clock's rep is
+        // __int128 -- a type std::to_string has no overload for, making the
+        // bare call ambiguous. Truncation is no concern for a fingerprint:
+        // the value only has to change when the mtime changes.
         line += timeEc ? std::string("?")
-                        : std::to_string(time.time_since_epoch().count());
+                        : std::to_string(static_cast<long long>(
+                              time.time_since_epoch().count()));
         lines.push_back(std::move(line));
     }
 

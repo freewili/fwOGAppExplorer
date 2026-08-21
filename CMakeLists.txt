@@ -122,6 +122,22 @@ if(UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
         add_link_options(-static-libstdc++ -static-libgcc)
     endif()
 endif()
+if(APPLE)
+    # Every executable names fwog_core/device/platform explicitly AND inherits
+    # them again through fwog_flash's PUBLIC links. Classic linkers dedup that
+    # silently; the Xcode 15 linker warns about it. It is the same static
+    # library either way, so silence the warning here rather than reshape
+    # every target_link_libraries line around one linker's tidiness.
+    # Probed rather than passed unconditionally: classic ld64 (Xcode < 15, or
+    # -ld_classic) ERRORS on the unknown option, which would turn a cosmetic
+    # silencing into a silent toolchain floor.
+    include(CheckLinkerFlag)
+    check_linker_flag(CXX "LINKER:-no_warn_duplicate_libraries"
+                      FWOG_LD_ACCEPTS_NO_WARN_DUPLICATE_LIBRARIES)
+    if(FWOG_LD_ACCEPTS_NO_WARN_DUPLICATE_LIBRARIES)
+        add_link_options(LINKER:-no_warn_duplicate_libraries)
+    endif()
+endif()
 
 include(FetchContent)
 # Runs BEFORE the embedding step: probe/probe.uf2 is one of the images that
@@ -299,6 +315,17 @@ if(WIN32)
     # PRESENTLY ATTACHED COM ports rather than reading the stale SERIALCOMM
     # registry key. See src/platform/fwSerialPorts.h.
     target_link_libraries(fwog_platform PRIVATE setupapi)
+endif()
+if(APPLE)
+    # IOKit is the macOS answer to what sysfs answers on Linux: which USB
+    # device a /dev/cu.* port belongs to (fwSerialPorts.cpp) and how many
+    # RP2040s are sitting in BOOTSEL (fwVolume.cpp). fwfinder links the same
+    # pair for the same reason.
+    target_link_libraries(fwog_platform PRIVATE
+        "-framework IOKit" "-framework CoreFoundation"
+        # DiskArbitration: the clean unmount after a flash that keeps macOS
+        # from posting "Disk Not Ejected Properly" when the bootrom reboots.
+        "-framework DiskArbitration")
 endif()
 
 # ---------------------------------------------------------------------------
